@@ -90,7 +90,7 @@ export default function App() {
     }
   }, [messages, isTyping])
 
-  const handleSendMessage = (textToSend) => {
+  const handleSendMessage = async (textToSend) => {
     const trimmed = (textToSend || input).trim()
     if (!trimmed || isTyping) return
 
@@ -115,19 +115,85 @@ export default function App() {
       setActiveHistoryId(newHistoryItem.id)
     }
 
-    // Simulate AI response delay
-    setTimeout(() => {
-      const responseData = generateCampusResponse(trimmed)
-      const assistantMessage = {
-        id: getNextId('asst_msg'),
-        sender: 'assistant',
-        text: responseData.text,
-        followUps: responseData.followUps,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    const assistantMsgId = getNextId('asst_msg')
+    const assistantTimestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+
+    try {
+      const response = await fetch('http://localhost:3000/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: trimmed, stream: true }),
+      })
+
+      if (!response.ok) {
+        throw new Error('Chat request failed')
       }
-      setMessages((prev) => [...prev, assistantMessage])
+
+      const contentType = response.headers.get('content-type') || ''
+
+      if (contentType.includes('application/json')) {
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || 'Chat request failed')
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: assistantMsgId,
+            sender: 'assistant',
+            text: data.text,
+            followUps: [],
+            timestamp: assistantTimestamp,
+          },
+        ])
+        setIsTyping(false)
+      } else {
+        // Stream text chunk-by-chunk for real-time typewriter display
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let accumulatedText = ''
+
+        // Create empty assistant bubble first
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: assistantMsgId,
+            sender: 'assistant',
+            text: '',
+            followUps: [],
+            timestamp: assistantTimestamp,
+          },
+        ])
+        setIsTyping(false)
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          accumulatedText += decoder.decode(value, { stream: true })
+
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === assistantMsgId ? { ...msg, text: accumulatedText } : msg
+            )
+          )
+        }
+      }
+    } catch (err) {
+      console.error('Chat error:', err)
+      setMessages((prev) => {
+        const exists = prev.some((m) => m.id === assistantMsgId)
+        const fallbackMsg = {
+          id: assistantMsgId,
+          sender: 'assistant',
+          text: 'I cannot access the UPangAssist knowledge service right now. Please try again later or contact the appropriate official UPang office.',
+          followUps: [],
+          timestamp: assistantTimestamp,
+        }
+        return exists
+          ? prev.map((m) => (m.id === assistantMsgId ? fallbackMsg : m))
+          : [...prev, fallbackMsg]
+      })
+    } finally {
       setIsTyping(false)
-    }, 450)
+    }
   }
 
   const handlePromptClick = (prompt) => {
