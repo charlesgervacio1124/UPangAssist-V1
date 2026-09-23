@@ -5,6 +5,7 @@ const fs = require("fs");
 const path = require("path");
 const mongoose = require("mongoose");
 const taskRoutes = require("./routes/taskRoutes");
+const { findSemanticReferences } = require("./semanticSearch");
 
 const app = express();
 app.use(express.json());
@@ -34,7 +35,7 @@ function getSearchWords(value) {
   const words = (value || "")
     .toLowerCase()
     .normalize("NFKD")
-    .replace(/[\\u0300-\\u036f]/g, "")
+    .replace(/[\u0300-\u036f]/g, "")
     .match(/[a-z0-9]{2,}/g)
     ?.filter((word) => !ignoredSearchWords.has(word)) || [];
 
@@ -81,6 +82,51 @@ function findBestInstantMatch(question) {
   return references[0] || null;
 }
 
+function findSpecificBuildingReference(question) {
+  const lower = question.toLowerCase();
+  const campusReference = getKnowledgeBase().find((reference) =>
+    (reference.category || "").toLowerCase().includes("campus navigation")
+  );
+
+  if (!campusReference) return null;
+
+  const buildingNames = [
+    "main building",
+    "cea building",
+    "cite building",
+    "university library",
+    "university gymnasium"
+  ];
+  const requestedBuilding = buildingNames.find((building) => lower.includes(building));
+
+  if (!requestedBuilding) return null;
+
+  const buildingEntry = campusReference.answer
+    .split("•")
+    .map((entry) => entry.trim())
+    .find((entry) => entry.toLowerCase().startsWith(`${requestedBuilding}:`));
+
+  if (!buildingEntry) return null;
+
+  return {
+    ...campusReference,
+    answer: `• ${buildingEntry}`
+  };
+}
+
+function findUnverifiedBuildingName(question) {
+  const match = question.match(/\b([a-z0-9-]{3,})\s+building\b/i);
+  const buildingName = match?.[1]?.toLowerCase();
+  if (!buildingName || ["the", "this", "that"].includes(buildingName)) return null;
+
+  const verifiedText = getKnowledgeBase()
+    .map((reference) => [reference.category, reference.question, reference.answer].filter(Boolean).join(" "))
+    .join(" ")
+    .toLowerCase();
+
+  return verifiedText.includes(buildingName) ? null : match[1];
+}
+
 function formatReferences(references) {
   if (references.length === 0) {
     return "No matching verified UPang reference was found in the knowledge base.";
@@ -93,14 +139,11 @@ function formatReferences(references) {
     `Information: ${reference.answer || "Not specified"}`,
     `Source: ${reference.source || "Not specified"}`,
     `Page/section: ${reference.page || "Not specified"}`,
-    `Related office: ${reference.office || "Not specified"}`,
-    `Last updated: ${reference.lastUpdated || "Not specified"}`
+    `Related office: ${reference.office || "Not specified"}`
   ].join("\n")).join("\n\n");
 }
 
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", process.env.CLIENT_ORIGIN || "http://localhost:5173");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
   res.header("Access-Control-Allow-Origin", req.headers.origin || "*");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -115,7 +158,7 @@ async function streamAnswerWithOllama(question, referenceContext, res) {
   const systemInstruction = `You are UPangAssist, a university information assistant for PHINMA University of Pangasinan (UPang).
 Answer student questions factually, warmly, and concisely using the verified UPang references below.
 Keep answers brief and straight to the point (under 3-4 sentences when possible).
-If you lack enough information, recommend contacting the official UPang office.
+If you lack enough information, clearly say that there is no verified reference for the specific question and recommend contacting the official UPang office.
 
 Verified UPang references:
 ${referenceContext}`;
@@ -189,8 +232,6 @@ async function generateAnswerWithOllama(question, referenceContext) {
 
   const systemInstruction = `You are UPangAssist, a helpful and student-friendly university information assistant for PHINMA University of Pangasinan (UPang).
 Answer strictly using the verified UPang references supplied below. Never invent or hallucinate policies, requirements, fees, dates, or contact details.
-If the references do not contain enough information to answer completely, clearly state that you do not have verified information on that specific topic and suggest contacting the relevant UPang department or office.
-Keep your answers clear, concise, and structured. Include the source and page/section where available.
 Keep your answers brief and straight to the point (under 3-4 sentences). Include source where available.
 
 Verified UPang references:
@@ -222,42 +263,32 @@ ${referenceContext}`;
   return data.message?.content?.trim();
 }
 
-async function generateAnswerWithGemini(question, referenceContext) {
-  if (!process.env.GEMINI_API_KEY) {
-    throw new Error("Gemini API key is not configured on the server");
-  }
-
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${process.env.GEMINI_MODEL || "gemini-2.0-flash"}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        system_instruction: {
-          parts: [{
-            text: "You are UPangAssist, a university information assistant. Answer only from the verified UPang references supplied below. Keep answers concise.\n\nVerified UPang references:\n" + referenceContext
-          }]
-        },
-        contents: [{ role: "user", parts: [{ text: question }] }]
-      })
-    }
-  );
-
-  const data = await response.json();
-  if (!response.ok) {
-    console.error("Gemini API error:", data);
-    throw new Error(data.error?.message || "Gemini could not answer the question");
-  }
-
-  return data.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("").trim();
-}
-
 app.post("/api/chat", async (req, res) => {
   const question = typeof req.body?.question === "string" ? req.body.question.trim() : "";
   const wantStream = req.body?.stream === true || req.query?.stream === "true";
 
   if (!question) {
     return res.status(400).json({ error: "question is required" });
+  }
+
+  const unverifiedBuilding = findUnverifiedBuildingName(question);
+  if (unverifiedBuilding) {
+    const message = `I do not have a verified UPang reference for the ${unverifiedBuilding} Building location. Please contact Campus Administration or the relevant college office for the current location.`;
+    if (wantStream) {
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      return res.end(message);
+    }
+    return res.json({ text: message, provider: "verified_reference_check" });
+  }
+
+  const specificBuilding = findSpecificBuildingReference(question);
+  if (specificBuilding) {
+    const specificBuildingText = `${specificBuilding.answer}\n\n*Source: ${specificBuilding.source || "UPang Campus Directory"} (${specificBuilding.page || "Campus Map"})*`;
+    if (wantStream) {
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      return res.end(specificBuildingText);
+    }
+    return res.json({ text: specificBuildingText, provider: "instant_knowledge_base" });
   }
 
   // 1. Instant Fast-Path for exact verified FAQ matches (<10ms response time)
@@ -271,7 +302,15 @@ app.post("/api/chat", async (req, res) => {
     return res.json({ text: instantText, provider: "instant_knowledge_base" });
   }
 
-  const references = findRelevantReferences(question);
+  // Semantic search understands paraphrases (for example, "register for classes"
+  // can find the enrollment guide). Keyword search remains a safe fallback.
+  let references = findRelevantReferences(question);
+  try {
+    const semanticReferences = await findSemanticReferences(question, getKnowledgeBase());
+    if (semanticReferences.length > 0) references = semanticReferences;
+  } catch (error) {
+    console.warn("Semantic search unavailable; using keyword search:", error.message);
+  }
   const referenceContext = formatReferences(references);
   const provider = (process.env.LLM_PROVIDER || "ollama").toLowerCase();
 
@@ -282,13 +321,9 @@ app.post("/api/chat", async (req, res) => {
     }
 
     let text = "";
-
     if (provider === "ollama") {
       text = await generateAnswerWithOllama(question, referenceContext);
-    } else if (provider === "gemini") {
-      text = await generateAnswerWithGemini(question, referenceContext);
     } else {
-      // Fallback knowledge-base match
       text = references.length > 0
         ? `${references[0].answer}\n\n*Source: ${references[0].source || "UPang Knowledge Base"} (${references[0].office || "Official Office"})*`
         : "I do not have enough verified information to answer this question. Please contact the appropriate UPang office for assistance.";
@@ -302,7 +337,6 @@ app.post("/api/chat", async (req, res) => {
   } catch (error) {
     console.error(`Chat error (${provider}):`, error.message);
 
-    // If local LLM is temporarily unreachable, fallback to direct knowledge base if matching
     // If local LLM is starting up or temporarily unavailable, use direct reference fallback
     if (references.length > 0) {
       const top = references[0];
@@ -311,10 +345,7 @@ app.post("/api/chat", async (req, res) => {
         res.setHeader("Content-Type", "text/plain; charset=utf-8");
         return res.end(fallbackText);
       }
-      return res.json({
-        text: fallbackText,
-        fallback: true
-      });
+      return res.json({ text: fallbackText, fallback: true });
     }
 
     // Keep the chat usable when the optional AI provider is offline and the
