@@ -9,6 +9,10 @@ const quickPrompts = [
   'Where are the campus buildings located?',
 ]
 
+// Use the same origin in production. During local development, Vite proxies
+// this path to the API server (see vite.config.js).
+const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/$/, '')
+
 // Mock responses tailored to PHINMA University of Pangasinan
 function generateCampusResponse(query) {
   const lower = query.toLowerCase()
@@ -82,6 +86,7 @@ export default function App() {
 
   const chatEndRef = useRef(null)
   const inputRef = useRef(null)
+  const streamBufferRef = useRef('')
 
   // Scroll to bottom when messages update
   useEffect(() => {
@@ -119,7 +124,7 @@ export default function App() {
     const assistantTimestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 
     try {
-      const response = await fetch('http://localhost:3000/api/chat', {
+      const response = await fetch(`${apiBaseUrl}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question: trimmed, stream: true }),
@@ -149,7 +154,7 @@ export default function App() {
         // Stream text chunk-by-chunk for real-time typewriter display
         const reader = response.body.getReader()
         const decoder = new TextDecoder()
-        let accumulatedText = ''
+        streamBufferRef.current = ''
 
         // Create empty assistant bubble first
         setMessages((prev) => [
@@ -167,7 +172,8 @@ export default function App() {
         while (true) {
           const { done, value } = await reader.read()
           if (done) break
-          accumulatedText += decoder.decode(value, { stream: true })
+          const accumulatedText = streamBufferRef.current + decoder.decode(value, { stream: true })
+          streamBufferRef.current = accumulatedText
 
           setMessages((prev) =>
             prev.map((msg) =>
@@ -178,13 +184,14 @@ export default function App() {
       }
     } catch (err) {
       console.error('Chat error:', err)
+      const fallbackResponse = generateCampusResponse(trimmed)
       setMessages((prev) => {
         const exists = prev.some((m) => m.id === assistantMsgId)
         const fallbackMsg = {
           id: assistantMsgId,
           sender: 'assistant',
-          text: 'I cannot access the UPangAssist knowledge service right now. Please try again later or contact the appropriate official UPang office.',
-          followUps: [],
+          text: fallbackResponse.text,
+          followUps: fallbackResponse.followUps,
           timestamp: assistantTimestamp,
         }
         return exists

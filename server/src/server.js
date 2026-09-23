@@ -14,54 +14,71 @@ function getKnowledgeBase() {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
+const ignoredSearchWords = new Set([
+  "about", "after", "also", "and", "are", "can", "could", "does", "for",
+  "from", "how", "is", "it", "me", "my", "of", "please", "the", "there",
+  "this", "to", "what", "when", "where", "which", "who", "with", "would",
+  "you", "your", "campus", "student", "students"
+]);
+
+const searchWordAliases = {
+  wear: ["dress", "uniform"],
+  wearing: ["dress", "uniform"],
+  clothes: ["dress", "uniform"],
+  clothing: ["dress", "uniform"],
+  aid: ["scholarship", "financial"],
+  hk: ["hawak", "kamay", "scholarship"]
+};
+
+function getSearchWords(value) {
+  const words = (value || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\\u0300-\\u036f]/g, "")
+    .match(/[a-z0-9]{2,}/g)
+    ?.filter((word) => !ignoredSearchWords.has(word)) || [];
+
+  return words.flatMap((word) => [word, ...(searchWordAliases[word] || [])]);
+}
+
+function normalizeSearchWord(word) {
+  if (word.length > 5 && word.endsWith("ies")) return `${word.slice(0, -3)}y`;
+  if (word.length > 4 && word.endsWith("s")) return word.slice(0, -1);
+  if (word.length > 6 && word.endsWith("ing")) return word.slice(0, -3);
+  return word;
+}
+
 function findRelevantReferences(question) {
-  const words = question.toLowerCase().match(/[a-z0-9]{3,}/g) || [];
+  const words = [...new Set(getSearchWords(question).map(normalizeSearchWord))];
 
   return getKnowledgeBase()
     .map((reference) => {
-      const searchableText = [
-        reference.category,
-        reference.question,
-        reference.answer,
-        reference.office,
-        reference.source
-      ].filter(Boolean).join(" ").toLowerCase();
-      const score = words.reduce((total, word) => total + (searchableText.includes(word) ? 1 : 0), 0);
+      const questionWords = new Set(getSearchWords(reference.question).map(normalizeSearchWord));
+      const categoryWords = new Set(getSearchWords(reference.category).map(normalizeSearchWord));
+      const answerWords = new Set(getSearchWords(reference.answer).map(normalizeSearchWord));
+      const officeWords = new Set(getSearchWords(reference.office).map(normalizeSearchWord));
+      const sourceWords = new Set(getSearchWords(reference.source).map(normalizeSearchWord));
+      const score = words.reduce((total, word) => {
+        const wordScore = Math.max(
+          questionWords.has(word) ? 8 : 0,
+          categoryWords.has(word) ? 6 : 0,
+          answerWords.has(word) ? 2 : 0,
+          officeWords.has(word) ? 2 : 0,
+          sourceWords.has(word) ? 1 : 0
+        );
+        return total + (wordScore > 0 ? wordScore + 4 : 0);
+      }, 0);
       return { reference, score };
     })
     .filter((item) => item.score > 0)
     .sort((first, second) => second.score - first.score)
-    .slice(0, 5)
-    .slice(0, 2)
+    .slice(0, 3)
     .map((item) => item.reference);
 }
 
 function findBestInstantMatch(question) {
-  const lower = question.toLowerCase();
-  const kb = getKnowledgeBase();
-
-  for (const item of kb) {
-    const q = (item.question || "").toLowerCase();
-    const cat = (item.category || "").toLowerCase();
-
-    if (
-      (lower.includes("registrar") && (q.includes("registrar") || cat.includes("registrar"))) ||
-      (lower.includes("tor") && q.includes("registrar")) ||
-      (lower.includes("transcript") && q.includes("registrar")) ||
-      (lower.includes("scholarship") && (q.includes("scholarship") || cat.includes("scholarship"))) ||
-      (lower.includes("hawak kamay") && q.includes("hawak kamay")) ||
-      (lower.includes("tuition") && (q.includes("tuition") || cat.includes("tuition"))) ||
-      (lower.includes("cashier") && q.includes("tuition")) ||
-      (lower.includes("installment") && q.includes("tuition")) ||
-      (lower.includes("enroll") && (q.includes("enroll") || cat.includes("enroll"))) ||
-      (lower.includes("clinic") && (q.includes("clinic") || cat.includes("health"))) ||
-      (lower.includes("guidance") && (q.includes("guidance") || cat.includes("health"))) ||
-      (lower.includes("building") && (q.includes("building") || cat.includes("navigation")))
-    ) {
-      return item;
-    }
-  }
-  return null;
+  const references = findRelevantReferences(question);
+  return references[0] || null;
 }
 
 function formatReferences(references) {
@@ -300,9 +317,14 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    return res.status(503).json({
-      error: `Could not connect to ${provider.toUpperCase()} (${error.message}). Please ensure Ollama is running ('ollama serve').`
-    });
+    // Keep the chat usable when the optional AI provider is offline and the
+    // question has no matching knowledge-base entry.
+    const unavailableText = "I couldn't find a verified UPang answer for that question right now. I can help with enrollment, Registrar services, tuition payments, scholarships, campus locations, and student wellness services. For other concerns, please contact the appropriate official UPang office.";
+    if (wantStream) {
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      return res.end(unavailableText);
+    }
+    return res.json({ text: unavailableText, fallback: true });
   }
 });
 
