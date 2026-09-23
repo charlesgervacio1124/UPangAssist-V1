@@ -77,11 +77,6 @@ function findRelevantReferences(question) {
     .map((item) => item.reference);
 }
 
-function findBestInstantMatch(question) {
-  const references = findRelevantReferences(question);
-  return references[0] || null;
-}
-
 function findSpecificBuildingReference(question) {
   const lower = question.toLowerCase();
   const campusReference = getKnowledgeBase().find((reference) =>
@@ -291,19 +286,7 @@ app.post("/api/chat", async (req, res) => {
     return res.json({ text: specificBuildingText, provider: "instant_knowledge_base" });
   }
 
-  // 1. Instant Fast-Path for exact verified FAQ matches (<10ms response time)
-  const instantMatch = findBestInstantMatch(question);
-  if (instantMatch) {
-    const instantText = `${instantMatch.answer}\n\n*Office: ${instantMatch.office || "Official UPang Office"} | Source: ${instantMatch.source || "Official UPang Guide"}*`;
-    if (wantStream) {
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      return res.end(instantText);
-    }
-    return res.json({ text: instantText, provider: "instant_knowledge_base" });
-  }
-
-  // Semantic search understands paraphrases (for example, "register for classes"
-  // can find the enrollment guide). Keyword search remains a safe fallback.
+  // Semantic search handles paraphrases; keyword search remains a safe fallback.
   let references = findRelevantReferences(question);
   try {
     const semanticReferences = await findSemanticReferences(question, getKnowledgeBase());
